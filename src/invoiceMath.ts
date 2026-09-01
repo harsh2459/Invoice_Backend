@@ -81,6 +81,30 @@ interface Tx {
 }
 
 /**
+ * Outstanding balance a client owed BEFORE the given invoice — the sum of
+ * (total - amount_paid) across every other invoice for the same client that is
+ * dated earlier (or same date with a lower id). Scope is the client across all
+ * companies. Returns 0 when there is no client_id.
+ *
+ * `runner` is anything with a `query` method (the pool's `query` export, or a tx).
+ */
+export async function previousClientBalance(
+  runner: { query: <R = any>(sql: string, params?: any[]) => Promise<R[]> },
+  opts: { clientId: number | null; invoiceDate: string; invoiceId: number }
+): Promise<number> {
+  if (!opts.clientId) return 0;
+  const rows = await runner.query<{ bal: string | number }>(
+    `SELECT COALESCE(SUM(total - amount_paid), 0) AS bal
+       FROM invoices
+      WHERE client_id = ?
+        AND id <> ?
+        AND (invoice_date < ? OR (invoice_date = ? AND id < ?))`,
+    [opts.clientId, opts.invoiceId, opts.invoiceDate, opts.invoiceDate, opts.invoiceId]
+  );
+  return round2(Number(rows[0]?.bal ?? 0));
+}
+
+/**
  * Recompute an invoice's `amount_paid` + `payment_status` from its
  * `invoice_payments` rows. Call inside a transaction after any payment mutation.
  */

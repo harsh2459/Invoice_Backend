@@ -6,6 +6,8 @@ import {
   paymentStatus,
   formatInvoiceNumber,
   recomputeInvoicePayment,
+  previousClientBalance,
+  round2,
   type RawItem,
 } from "../invoiceMath";
 import { renderInvoicePdf } from "../invoicePdf";
@@ -104,6 +106,27 @@ router.get("/next-number/:companyId", async (req, res, next) => {
   }
 });
 
+// ---- client's outstanding balance (form helper) ----
+// Sum of (total - amount_paid) across all of a client's invoices, all companies.
+
+router.get("/client-balance", async (req, res, next) => {
+  try {
+    const clientId = Number(req.query.client_id);
+    if (!clientId) {
+      res.json({ prior_due: 0 });
+      return;
+    }
+    const [row] = await query<{ bal: string | number }>(
+      `SELECT COALESCE(SUM(total - amount_paid), 0) AS bal
+         FROM invoices WHERE client_id = ?`,
+      [clientId]
+    );
+    res.json({ prior_due: round2(Number(row?.bal ?? 0)) });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ---- view ----
 
 router.get("/:id", async (req, res, next) => {
@@ -137,7 +160,19 @@ router.get("/:id", async (req, res, next) => {
        ORDER BY ip.paid_on, ip.id`,
       [req.params.id]
     );
-    res.json({ ...rows[0], items, payments });
+
+    const inv = rows[0];
+    const previous_balance = await previousClientBalance(
+      { query },
+      {
+        clientId: inv.client_id,
+        invoiceDate: String(inv.invoice_date).slice(0, 10),
+        invoiceId: inv.id,
+      }
+    );
+    const current_balance = round2(previous_balance + Number(inv.balance || 0));
+
+    res.json({ ...inv, items, payments, previous_balance, current_balance });
   } catch (err) {
     next(err);
   }
@@ -147,13 +182,19 @@ router.get("/:id", async (req, res, next) => {
 
 router.post("/", requireAdmin, async (req: AuthRequest, res, next) => {
   try {
-    const { company_id, client_id, invoice_date, due_date, number, notes } = req.body;
+    const { company_id, client_id, due_date, number, notes } = req.body;
+    // New invoices are always dated today — no back- or post-dating.
+    const invoice_date = new Date().toISOString().slice(0, 10);
     const discount = Number(req.body.discount ?? 0);
     const discountIsPct = req.body.discount_is_pct !== false && req.body.discount_is_pct !== 0;
     const items = parseItems(req.body);
 
-    if (!company_id || !client_id || !invoice_date) {
-      res.status(400).json({ error: "Company, client and date are required" });
+    if (!company_id || !client_id) {
+      res.status(400).json({ error: "Company and client are required" });
+      return;
+    }
+    if (due_date && String(due_date).slice(0, 10) < invoice_date) {
+      res.status(400).json({ error: "Due date cannot be before today" });
       return;
     }
     if (items.length === 0) {
@@ -247,11 +288,12 @@ router.post("/", requireAdmin, async (req: AuthRequest, res, next) => {
         note: `Invoice ${finalNumber}`,
       });
 
-      // optional "payment received now" recorded with the invoice
+      // optional "payment received now" recorded with the invoice.
+      // If it exceeds this invoice's total, the surplus is applied to the
+      // client's oldest unpaid invoices (FIFO) — settling old dues.
       const payAmount = Number(req.body.payment?.amount ?? 0);
       let payInfo: { amount_paid: number; payment_status: string; balance: number } | null = null;
       if (payAmount > 0) {
-        const amt = Math.min(Math.round((payAmount + Number.EPSILON) * 100) / 100, t.total);
         const paidOn =
           (req.body.payment?.paid_on as string) || invoice_date || new Date().toISOString().slice(0, 10);
         let bankId = req.body.payment?.bank_account_id
@@ -264,12 +306,43 @@ router.post("/", requireAdmin, async (req: AuthRequest, res, next) => {
           );
           if (!ba[0] || Number(ba[0].company_id) !== Number(company_id)) bankId = null;
         }
+
+        // 1. this invoice first
+        const onThis = round2(Math.min(payAmount, t.total));
         await tx.exec(
           "INSERT INTO invoice_payments (invoice_id, bank_account_id, paid_on, amount, created_by) VALUES (?, ?, ?, ?, ?)",
-          [header.insertId, bankId, paidOn, amt, req.user!.id]
+          [header.insertId, bankId, paidOn, onThis, req.user!.id]
         );
         payInfo = await recomputeInvoicePayment(tx, header.insertId);
+
+        // 2. surplus → oldest unpaid invoices for this client
+        let surplus = round2(payAmount - onThis);
+        if (surplus > 0.009) {
+          const dues = await tx.query<any>(
+            `SELECT id, (total - amount_paid) AS due
+               FROM invoices
+              WHERE client_id = ? AND id <> ? AND (total - amount_paid) > 0.009
+              ORDER BY invoice_date ASC, id ASC`,
+            [client_id, header.insertId]
+          );
+          for (const d of dues) {
+            if (surplus <= 0.009) break;
+            const apply = round2(Math.min(surplus, Number(d.due)));
+            await tx.exec(
+              "INSERT INTO invoice_payments (invoice_id, bank_account_id, paid_on, amount, created_by) VALUES (?, ?, ?, ?, ?)",
+              [d.id, bankId, paidOn, apply, req.user!.id]
+            );
+            await recomputeInvoicePayment(tx, d.id);
+            surplus = round2(surplus - apply);
+          }
+        }
       }
+
+      // client's total outstanding after everything above
+      const [cb] = await tx.query<any>(
+        `SELECT COALESCE(SUM(total - amount_paid), 0) AS bal FROM invoices WHERE client_id = ?`,
+        [client_id]
+      );
 
       return {
         id: header.insertId,
@@ -278,6 +351,7 @@ router.post("/", requireAdmin, async (req: AuthRequest, res, next) => {
         amount_paid: payInfo?.amount_paid ?? 0,
         payment_status: payInfo?.payment_status ?? "unpaid",
         balance: payInfo?.balance ?? t.total,
+        client_balance: round2(Number(cb?.bal ?? 0)),
       };
     });
 

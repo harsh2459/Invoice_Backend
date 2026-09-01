@@ -30,6 +30,8 @@ import { Router } from "express";
 import { query, exec } from "../db";
 import { authenticate, requireAdmin, AuthRequest } from "../middleware/auth";
 import { renderInvoicePdf } from "../invoicePdf";
+import { previousClientBalance } from "../invoiceMath";
+import { publicInvoiceUrl } from "./publicInvoice";
 import {
   getState,
   connect,
@@ -61,9 +63,31 @@ export interface WaTemplates {
 
 const DEFAULT_TEMPLATES: WaTemplates = {
   invoice:
-    "Hi {{client_name}},\n\nPlease find attached invoice {{invoice_number}} dated {{invoice_date}} from {{company_name}}.\n\nAmount: {{total}}\n\nThank you for your business.",
+    "Greetings from {{company_name}}\n" +
+    "We are pleased to have you as a valuable customer. Please find the details of your transaction.\n\n" +
+    "Sale Invoice : {{invoice_number}}\n" +
+    "Date: {{invoice_date}}\n" +
+    "Items: {{item_count}}  |  Total Qty: {{total_qty}}\n" +
+    "Invoice Amount: {{total}}\n" +
+    "{{gst_line}}" +
+    "Received: {{amount_paid}}\n" +
+    "{{previous_balance_line}}" +
+    "Balance: {{balance}}\n" +
+    "{{current_balance_line}}\n" +
+    "Thanks for doing business with us.\n" +
+    "Regards,\n{{company_name}}\n\n" +
+    "Invoice Link:\n{{invoice_link}}",
   reminder:
-    "Hi {{client_name}},\n\nGentle reminder: invoice {{invoice_number}} from {{company_name}} has an outstanding balance of {{balance}}{{due_clause}}.\n\nTotal: {{total}} | Paid: {{amount_paid}}\n\nPlease arrange the payment at your earliest convenience.",
+    "Greetings from {{company_name}}\n\n" +
+    "Gentle reminder for invoice {{invoice_number}} dated {{invoice_date}}.\n\n" +
+    "Invoice Amount: {{total}}\n" +
+    "Received: {{amount_paid}}\n" +
+    "{{previous_balance_line}}" +
+    "Balance Due: {{balance}}\n" +
+    "{{current_balance_line}}\n" +
+    "Please arrange the payment at your earliest convenience.\n\n" +
+    "Regards,\n{{company_name}}\n\n" +
+    "Invoice Link:\n{{invoice_link}}",
   thankyou:
     "Hi {{client_name}},\n\nWe have received your payment against invoice {{invoice_number}}. Thank you!\n\n{{company_name}}",
 };
@@ -78,7 +102,10 @@ async function loadTemplates(): Promise<WaTemplates> {
   }
 }
 
-function invoiceVars(inv: any): Record<string, string> {
+function invoiceVars(
+  inv: any,
+  extra?: { items?: any[]; previousBalance?: number; invoiceLink?: string }
+): Record<string, string> {
   const inr = (n: any) =>
     "Rs. " + Number(n || 0).toLocaleString("en-IN", { maximumFractionDigits: 2 });
   const d = (v: any) => {
@@ -89,6 +116,13 @@ function invoiceVars(inv: any): Record<string, string> {
   const total = Number(inv.total || 0);
   const paid = Number(inv.amount_paid || 0);
   const balance = Math.round((total - paid) * 100) / 100;
+  const items = extra?.items || [];
+  const totalQty = items.reduce((s, it) => s + Number(it.qty || 0), 0);
+  const itemsTotal = items.reduce((s, it) => s + Number(it.amount || 0), 0);
+  const prev = Math.round((extra?.previousBalance || 0) * 100) / 100;
+  const current = Math.round((prev + balance) * 100) / 100;
+  const gst = Number(inv.tax_total || 0);
+
   return {
     client_name: inv.client_name || "there",
     company_name: inv.company_name || "us",
@@ -99,6 +133,15 @@ function invoiceVars(inv: any): Record<string, string> {
     total: inr(total),
     amount_paid: inr(paid),
     balance: inr(balance),
+    item_count: String(items.length),
+    total_qty: Number.isInteger(totalQty) ? String(totalQty) : totalQty.toFixed(2),
+    items_total: inr(itemsTotal),
+    gst_line: gst > 0 ? `GST: ${inr(gst)}\n` : "",
+    previous_balance: inr(prev),
+    previous_balance_line: prev > 0.009 ? `Previous Balance: ${inr(prev)}\n` : "",
+    current_balance: inr(current),
+    current_balance_line: prev > 0.009 ? `Current Balance (total outstanding): ${inr(current)}\n` : "",
+    invoice_link: extra?.invoiceLink || "",
     status:
       inv.payment_status === "paid"
         ? "Paid"
@@ -354,7 +397,13 @@ async function loadInvoiceForSend(id: string | string[]) {
      WHERE i.id = ?`,
     [String(id)]
   );
-  return rows[0] || null;
+  const inv = rows[0];
+  if (!inv) return null;
+  inv.items = await query<any>(
+    "SELECT description, qty, rate, amount, gst_rate, tax_amount FROM invoice_items WHERE invoice_id = ? ORDER BY id",
+    [String(id)]
+  );
+  return inv;
 }
 
 async function recordSend(opts: {
@@ -426,7 +475,20 @@ async function handleDocumentSend(
     }
 
     const templates = await loadTemplates();
-    const vars = invoiceVars(inv);
+    const origin = `${req.protocol}://${req.get("host")}`;
+    const previousBalance = await previousClientBalance(
+      { query },
+      {
+        clientId: inv.client_id,
+        invoiceDate: String(inv.invoice_date).slice(0, 10),
+        invoiceId: inv.id,
+      }
+    );
+    const vars = invoiceVars(inv, {
+      items: inv.items,
+      previousBalance,
+      invoiceLink: publicInvoiceUrl(inv.id, origin),
+    });
     const body =
       typeof req.body.message === "string" && req.body.message.trim()
         ? req.body.message
@@ -474,6 +536,39 @@ async function handleDocumentSend(
     next(err);
   }
 }
+
+// Filled message preview — what will actually be sent (WYSIWYG for the modal).
+router.get("/send/:kind/:id/preview", async (req, res, next) => {
+  try {
+    const kind = req.params.kind === "reminder" ? "reminder" : "invoice";
+    const inv = await loadInvoiceForSend(req.params.id);
+    if (!inv) {
+      res.status(404).json({ error: "Invoice not found" });
+      return;
+    }
+    const templates = await loadTemplates();
+    const origin = `${req.protocol}://${req.get("host")}`;
+    const previousBalance = await previousClientBalance(
+      { query },
+      {
+        clientId: inv.client_id,
+        invoiceDate: String(inv.invoice_date).slice(0, 10),
+        invoiceId: inv.id,
+      }
+    );
+    const vars = invoiceVars(inv, {
+      items: inv.items,
+      previousBalance,
+      invoiceLink: publicInvoiceUrl(inv.id, origin),
+    });
+    res.json({
+      message: fillTemplate(kind === "invoice" ? templates.invoice : templates.reminder, vars),
+      phone: inv.client_phone || "",
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
 router.post("/send/invoice/:id", (req: AuthRequest, res, next) =>
   handleDocumentSend(req, res, next, "invoice")

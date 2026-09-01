@@ -13,27 +13,17 @@
  */
 import { query } from "./db";
 import { PDFDocument, ddmmyyyy, INR, amountInWords } from "./pdf";
+import { previousClientBalance } from "./invoiceMath";
 
-const BRAND = "#2f5496"; // header bar / accents (matches the reference invoice)
+const BAND = "#8C86D9"; // lavender section bands (matches the reference invoice)
+const BAND_TEXT = "#ffffff";
 const INK = "#1f272e";
-const MUTE = "#6b7280";
-const HAIR = "#e4e7eb";
-const ZEBRA = "#f4f6fb";
-const PANEL = "#eef2fb";
+const MUTE = "#5b616b";
+const HAIR = "#b9b5e6"; // grid lines inside the table
+const OUTER = "#8C86D9"; // page border
 
 export function invoicePdfFilename(inv: { number?: string | null; id: number }): string {
   return `Invoice_${(inv.number || inv.id).toString().replace(/[^\w-]/g, "_")}.pdf`;
-}
-
-/** Derive a human "Terms" string from invoice/due dates. */
-function termsLabel(invoiceDate: any, dueDate: any): string {
-  if (!dueDate) return "Due on Receipt";
-  const a = new Date(String(invoiceDate).slice(0, 10));
-  const b = new Date(String(dueDate).slice(0, 10));
-  const days = Math.round((b.getTime() - a.getTime()) / 86400000);
-  if (!Number.isFinite(days) || days <= 0) return "Due on Receipt";
-  if (days === 15 || days === 30 || days === 45 || days === 60 || days === 90) return `Net ${days}`;
-  return `Net ${days} days`;
 }
 
 /** Load an invoice and draw its PDF. Rejects with a tagged error when not found. */
@@ -66,22 +56,26 @@ export async function renderInvoicePdf(invoiceId: number | string | string[]): P
     [String(invoiceId)]
   );
 
-  const buffer = await drawInvoice(inv, co, items);
+  const prevBalance = await previousClientBalance(
+    { query },
+    { clientId: inv.client_id, invoiceDate: String(inv.invoice_date).slice(0, 10), invoiceId: inv.id }
+  );
+
+  const buffer = await drawInvoice(inv, co, items, prevBalance);
   return { buffer, filename: invoicePdfFilename(inv), invoice: inv };
 }
 
-function drawInvoice(inv: any, co: any, items: any[]): Promise<Buffer> {
+function drawInvoice(inv: any, co: any, items: any[], prevBalance = 0): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const total = Number(inv.total || 0);
     const paid = Number(inv.amount_paid || 0);
     const balance = Math.round((total - paid) * 100) / 100;
-    const hasTax = items.some((it: any) => Number(it.tax_amount) > 0);
-    const hasHsn = items.some((it: any) => it.hsn);
-    const taxable = Number(inv.subtotal) - Number(inv.discount_value || 0);
-    const blendedRate =
-      hasTax && taxable > 0 ? Math.round((Number(inv.tax_total) / taxable) * 10000) / 100 : 0;
+    const currentBalance = Math.round((prevBalance + balance) * 100) / 100;
+    // HSN column only when at least one line actually has an HSN/SAC.
+    const hasHsn = items.some((it: any) => it.hsn && String(it.hsn).trim());
+    const qtySum = items.reduce((s: number, it: any) => s + Number(it.qty || 0), 0);
 
-    const doc = new PDFDocument({ margin: 44, size: "A4" });
+    const doc = new PDFDocument({ margin: 34, size: "A4" });
     const chunks: Buffer[] = [];
     doc.on("data", (c: Buffer) => chunks.push(c));
     doc.on("end", () => resolve(Buffer.concat(chunks)));
@@ -90,261 +84,278 @@ function drawInvoice(inv: any, co: any, items: any[]): Promise<Buffer> {
     const left = doc.page.margins.left;
     const right = doc.page.width - doc.page.margins.right;
     const contentW = right - left;
+    const pageBottom = doc.page.height - doc.page.margins.bottom;
 
-    // ============ 1. brand rule + masthead ============
-    doc.rect(left, doc.y, contentW, 4).fill(BRAND);
-    const headTop = doc.y + 18;
+    const rule = (yy: number) =>
+      doc.moveTo(left, yy).lineTo(right, yy).lineWidth(0.7).strokeColor(HAIR).stroke();
+    const vline = (xx: number, y1: number, y2: number) =>
+      doc.moveTo(xx, y1).lineTo(xx, y2).lineWidth(0.7).strokeColor(HAIR).stroke();
+    const band = (yy: number, h: number) => doc.rect(left, yy, contentW, h).fill(BAND);
 
-    const LOGO = 84;
-    let textX = left;
-    let logoBottom = headTop;
+    // ---- title ----
+    let y = left; // top margin
+    doc.font("Helvetica-Bold").fontSize(13).fillColor(INK).text("Tax Invoice", left, y, {
+      width: contentW,
+      align: "center",
+    });
+    y += 22;
+
+    // ---- masthead box: logo left, company block right ----
+    const headTop = y;
+    const headH = 62;
+    doc.rect(left, headTop, contentW, headH).lineWidth(0.8).strokeColor(OUTER).stroke();
     if (co.logo && typeof co.logo === "string" && co.logo.startsWith("data:image")) {
       try {
         const buf = Buffer.from(co.logo.split(",")[1], "base64");
-        doc.image(buf, left, headTop, { fit: [LOGO, LOGO], align: "center", valign: "center" });
-        textX = left + LOGO + 16;
-        logoBottom = headTop + LOGO;
+        doc.image(buf, left + 8, headTop + 8, { fit: [90, headH - 16] });
       } catch {
-        /* bad image data — skip */
+        /* skip bad image */
       }
     }
-    doc.fillColor(INK).font("Helvetica-Bold").fontSize(16).text(co.name || "Company", textX, headTop + 2, {
-      width: contentW - (textX - left) - 200,
-    });
+    doc.font("Helvetica-Bold").fontSize(15).fillColor(INK).text(
+      (co.name || "Company").toUpperCase(),
+      right - 320,
+      headTop + 12,
+      { width: 312, align: "right" }
+    );
     doc.font("Helvetica").fontSize(8).fillColor(MUTE).text(
       [
-        co.address,
-        [co.phone, co.email].filter(Boolean).join("  •  "),
-        co.gstin ? `GSTIN: ${co.gstin}` : "",
+        co.phone ? `Phone no.: ${co.phone}` : "",
+        co.email ? `Email: ${co.email}` : "",
       ]
         .filter(Boolean)
-        .join("\n"),
-      textX,
-      headTop + 24,
-      { width: contentW - (textX - left) - 200 }
+        .join("   "),
+      right - 320,
+      headTop + 33,
+      { width: 312, align: "right" }
     );
+    if (co.gstin) {
+      doc.text(`GSTIN: ${co.gstin}`, right - 320, headTop + 44, { width: 312, align: "right" });
+    }
+    y = headTop + headH;
 
-    doc.fillColor(BRAND).font("Helvetica-Bold").fontSize(32);
-    doc.text("INVOICE", right - 240, headTop - 6, { width: 240, align: "right" });
-    doc.font("Helvetica").fontSize(9).fillColor(MUTE);
-    doc.text(inv.number ? `# ${inv.number}` : `# ${inv.id}`, right - 240, headTop + 34, {
-      width: 240,
+    // ---- Bill To | Invoice Details band ----
+    const bandH = 15;
+    band(y, bandH);
+    doc.font("Helvetica-Bold").fontSize(8.5).fillColor(BAND_TEXT);
+    doc.text("Bill To", left + 6, y + 4);
+    doc.text("Invoice Details", left + contentW / 2 + 6, y + 4, {
+      width: contentW / 2 - 12,
       align: "right",
     });
+    y += bandH;
 
-    // ============ 2. meta grid (full-width boxed label:value pairs) ============
-    const showTerms = !!inv.due_date;
-    let y = Math.max(headTop + 70, logoBottom + 6) + 8;
-    const metaRows: [string, string][] = [
-      ["Invoice#", inv.number || `INV-${String(inv.id).padStart(6, "0")}`],
-      ["Invoice Date", ddmmyyyy(inv.invoice_date)],
-      ...((showTerms
-        ? [
-            ["Terms", termsLabel(inv.invoice_date, inv.due_date)],
-            ["Due Date", ddmmyyyy(inv.due_date)],
-          ]
-        : []) as [string, string][]),
-    ];
-    const rh = 20;
-    const cellW = contentW / metaRows.length;
-    doc.rect(left, y, contentW, rh * 2).strokeColor(HAIR).lineWidth(1).stroke();
-    doc.moveTo(left, y + rh).lineTo(right, y + rh).strokeColor(HAIR).stroke();
-    metaRows.forEach(([k, v], i) => {
-      const cxp = left + i * cellW;
-      if (i) doc.moveTo(cxp, y).lineTo(cxp, y + rh * 2).strokeColor(HAIR).stroke();
-      doc.font("Helvetica").fontSize(8).fillColor(MUTE).text(k, cxp + 8, y + 6, { width: cellW - 16 });
-      doc
-        .font("Helvetica-Bold")
-        .fontSize(9)
-        .fillColor(INK)
-        .text(v, cxp + 8, y + rh + 5, { width: cellW - 16 });
+    const partyH = 50;
+    doc.rect(left, y, contentW, partyH).lineWidth(0.8).strokeColor(OUTER).stroke();
+    vline(left + contentW / 2, y, y + partyH);
+    // left: client
+    doc.font("Helvetica-Bold").fontSize(9).fillColor(INK).text(inv.client_name || "—", left + 6, y + 5, {
+      width: contentW / 2 - 12,
     });
-    y += rh * 2 + 18;
+    doc.font("Helvetica").fontSize(8).fillColor(MUTE);
+    const clientLines = [
+      inv.client_phone ? `Contact No. : ${inv.client_phone}` : "",
+      inv.client_address || "",
+      inv.client_gstin ? `GSTIN : ${inv.client_gstin}` : "",
+    ].filter(Boolean);
+    doc.text(clientLines.join("\n"), left + 6, y + 18, { width: contentW / 2 - 12 });
+    // right: invoice no + date
+    const rx = left + contentW / 2 + 6;
+    const rw = contentW / 2 - 12;
+    doc.font("Helvetica").fontSize(8.5).fillColor(INK);
+    doc.text(`Invoice No. : ${inv.number || inv.id}`, rx, y + 8, { width: rw, align: "right" });
+    doc.text(`Date : ${ddmmyyyy(inv.invoice_date)}`, rx, y + 22, { width: rw, align: "right" });
+    if (inv.due_date)
+      doc.text(`Due : ${ddmmyyyy(inv.due_date)}`, rx, y + 33, { width: rw, align: "right" });
+    y += partyH;
 
-    // ============ 3. Bill To / Ship To ============
-    const partyTop = y;
-    const halfW = contentW / 2 - 12;
-    const shipX = left + contentW / 2 + 12;
+    // ---- items table ----
+    type Col = { title: string; w: number; align: "left" | "right" | "center" };
+    const cols: Col[] = [
+      { title: "#", w: 26, align: "center" },
+      { title: "Item name", w: 0, align: "left" },
+      ...(hasHsn ? [{ title: "HSN/ SAC", w: 90, align: "left" as const }] : []),
+      { title: "Quantity", w: 78, align: "right" },
+      { title: "Price/ Unit", w: 90, align: "right" },
+      { title: "Amount", w: 90, align: "right" },
+    ];
+    const fixedW = cols.reduce((s, c) => s + c.w, 0);
+    cols.find((c) => c.title === "Item name")!.w = contentW - fixedW;
 
-    const party = (label: string, x: number, w: number) => {
-      doc.font("Helvetica-Bold").fontSize(9).fillColor(BRAND).text(label, x, partyTop, { width: w });
-      doc
-        .font("Helvetica-Bold")
-        .fontSize(9.5)
-        .fillColor(INK)
-        .text(inv.client_name || "—", x, partyTop + 14, { width: w });
-      const lines = [
-        inv.client_address,
-        inv.client_gstin ? `GSTIN: ${inv.client_gstin}` : "",
-        [inv.client_phone, inv.client_email].filter(Boolean).join("  •  "),
-      ].filter(Boolean);
-      if (lines.length)
-        doc
-          .font("Helvetica")
-          .fontSize(8)
-          .fillColor(MUTE)
-          .text(lines.join("\n"), x, partyTop + 28, { width: w });
+    const drawHead = (yy: number) => {
+      const hH = 16;
+      band(yy, hH);
+      doc.font("Helvetica-Bold").fontSize(8).fillColor(BAND_TEXT);
+      let cx = left;
+      cols.forEach((c) => {
+        doc.text(c.title, cx + 5, yy + 4.5, { width: c.w - 10, align: c.align });
+        cx += c.w;
+      });
+      return yy + hH;
     };
-    party("Bill To", left, halfW);
-    party("Ship To", shipX, halfW);
+    y = drawHead(y);
+    const tableLeftEdge = y;
 
-    y = partyTop + 86;
-    doc.y = y;
-
-    // ============ 4. items table ============
-    const cols: { title: string; w: number; align: "left" | "right" | "center" }[] = [
-      { title: "#", w: 24, align: "center" },
-      ...(hasHsn ? [{ title: "HSN", w: 46, align: "left" as const }] : []),
-      { title: "Item & Description", w: 0, align: "left" },
-      { title: "Qty", w: 48, align: "right" },
-      { title: "Rate", w: 72, align: "right" },
-      ...(hasTax ? [{ title: "GST", w: 42, align: "right" as const }] : []),
-      { title: "Amount", w: 78, align: "right" },
-    ];
-    const fixed = cols.reduce((s, c) => s + c.w, 0);
-    cols.find((c) => c.title === "Item & Description")!.w = contentW - fixed;
-
-    const headH = 22;
-    const hy = doc.y;
-    doc.rect(left, hy, contentW, headH).fill(BRAND);
-    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(8.5);
-    let cx = left;
-    cols.forEach((c) => {
-      doc.text(c.title.toUpperCase(), cx + 6, hy + 7, { width: c.w - 12, align: c.align });
-      cx += c.w;
-    });
-    doc.y = hy + headH;
-
-    const bottom = () => doc.page.height - doc.page.margins.bottom - 4;
+    doc.font("Helvetica").fontSize(8.5).fillColor(INK);
     items.forEach((it: any, i: number) => {
-      const qty = Number(it.qty);
-      const descLines = doc.heightOfString(it.description || "", {
-        width: cols.find((c) => c.title === "Item & Description")!.w - 12,
-        // measure at the body font size used below
-      });
-      const rowH = Math.max(26, 12 + descLines);
-      if (doc.y + rowH > bottom()) doc.addPage();
-      const ry = doc.y;
-      if (i % 2 === 1) doc.rect(left, ry, contentW, rowH).fill(ZEBRA);
-
-      const cells: { text: string; sub?: string }[] = [
-        { text: String(i + 1) },
-        ...(hasHsn ? [{ text: it.hsn || "" }] : []),
-        { text: it.description || "" },
-        { text: Number.isInteger(qty) ? String(qty) : qty.toString(), sub: "Piece" },
-        { text: INR(Number(it.rate)) },
-        ...(hasTax ? [{ text: `${Number(it.gst_rate)}%` }] : []),
-        { text: INR(Number(it.amount)) },
+      const qty = Number(it.qty || 0);
+      const nameW = cols[1].w - 10;
+      const nameH = doc.heightOfString(it.description || "", { width: nameW });
+      const rowH = Math.max(18, nameH + 8);
+      if (y + rowH > pageBottom - 40) {
+        doc.addPage();
+        y = left;
+        y = drawHead(y);
+      }
+      const ry = y;
+      const cells = [
+        String(i + 1),
+        it.description || "",
+        ...(hasHsn ? [it.hsn || ""] : []),
+        Number.isInteger(qty) ? String(qty) : String(qty),
+        INR(Number(it.rate || 0)),
+        INR(Number(it.amount || 0)),
       ];
-      let x = left;
-      cells.forEach((cell, ci) => {
+      let cx = left;
+      cells.forEach((txt, ci) => {
         const c = cols[ci];
-        doc.font("Helvetica").fontSize(8.5).fillColor(INK);
-        doc.text(cell.text, x + 6, ry + 6, { width: c.w - 12, align: c.align });
-        if (cell.sub) {
-          doc.font("Helvetica").fontSize(7).fillColor(MUTE);
-          doc.text(cell.sub, x + 6, ry + 17, { width: c.w - 12, align: c.align });
-        }
-        x += c.w;
+        doc
+          .font(ci === 1 ? "Helvetica-Bold" : "Helvetica")
+          .fontSize(8.5)
+          .fillColor(INK)
+          .text(txt, cx + 5, ry + 4, { width: c.w - 10, align: c.align });
+        cx += c.w;
       });
-      doc.moveTo(left, ry + rowH).lineTo(right, ry + rowH).strokeColor(HAIR).lineWidth(1).stroke();
-      doc.y = ry + rowH;
+      y = ry + rowH;
+      rule(y);
     });
 
-    // ============ 5. totals panel ============
-    doc.y += 14;
-    const panelW = 240;
-    const panelX = right - panelW;
-    const lineH = 17;
-    const totalLines: [string, string, boolean, string?][] = [
-      ["Sub Total", INR(Number(inv.subtotal)), false],
+    // Total row
+    {
+      const rowH = 18;
+      if (y + rowH > pageBottom - 40) {
+        doc.addPage();
+        y = left;
+      }
+      const ry = y;
+      doc.font("Helvetica-Bold").fontSize(8.5).fillColor(INK);
+      doc.text("Total", left + cols[0].w + 5, ry + 4, { width: cols[1].w - 10 });
+      // qty column
+      let qx = left + cols[0].w + cols[1].w + (hasHsn ? cols[2].w : 0);
+      const qCol = cols.find((c) => c.title === "Quantity")!;
+      doc.text(
+        Number.isInteger(qtySum) ? String(qtySum) : String(qtySum),
+        qx + 5,
+        ry + 4,
+        { width: qCol.w - 10, align: "right" }
+      );
+      const aCol = cols[cols.length - 1];
+      doc.text(INR(total), right - aCol.w + 5, ry + 4, { width: aCol.w - 10, align: "right" });
+      y = ry + rowH;
+    }
+
+    // vertical rules + outer border for the whole table
+    let vx = left;
+    for (let i = 0; i < cols.length; i++) {
+      vline(vx, tableLeftEdge - 16, y);
+      vx += cols[i].w;
+    }
+    vline(right, tableLeftEdge - 16, y);
+    doc.moveTo(left, y).lineTo(right, y).lineWidth(0.8).strokeColor(OUTER).stroke();
+
+    // ---- Invoice Amount In Words | Amounts ----
+    band(y, bandH);
+    doc.font("Helvetica-Bold").fontSize(8.5).fillColor(BAND_TEXT);
+    doc.text("Invoice Amount In Words", left + 6, y + 4);
+    doc.text("Amounts", left + contentW / 2 + 6, y + 4);
+    y += bandH;
+
+    const amtRows: [string, string, boolean][] = [
+      ["Sub Total", INR(Number(inv.subtotal || total)), false],
     ];
     if (Number(inv.discount_value) > 0) {
       const dl = inv.discount_is_pct ? `Discount (${Number(inv.discount)}%)` : "Discount";
-      totalLines.push([dl, "- " + INR(Number(inv.discount_value)), false]);
-      totalLines.push(["Taxable", INR(taxable), false]);
+      amtRows.push([dl, "- " + INR(Number(inv.discount_value)), false]);
     }
-    if (hasTax) totalLines.push([`Tax Rate`, `${blendedRate}%`, false]);
-    if (hasTax) totalLines.push([`Total GST`, INR(Number(inv.tax_total)), false]);
-    totalLines.push(["Grand Total", INR(total), true, BRAND]);
-    const isPaid = inv.payment_status === "paid" || balance <= 0.009;
-    if (paid > 0) totalLines.push(["Amount Paid", "- " + INR(paid), false, "#1B9E5A"]);
-    totalLines.push([
-      isPaid ? "Amount Due" : "Balance Due",
-      isPaid ? INR(0) : INR(balance),
-      true,
-      isPaid ? "#1B9E5A" : "#C0392B",
-    ]);
+    if (Number(inv.tax_total) > 0) amtRows.push(["Total GST", INR(Number(inv.tax_total)), false]);
+    amtRows.push(["Total", INR(total), true]);
+    amtRows.push(["Received", INR(paid), false]);
+    amtRows.push(["Balance", INR(balance), true]);
 
-    const panelH = lineH * totalLines.length + 10;
-    if (doc.y + panelH + 24 > bottom()) doc.addPage();
-    const py = doc.y;
-    doc.rect(panelX, py, panelW, panelH).fill(PANEL);
-    let ly = py + 6;
-    totalLines.forEach(([k, v, strong, color]) => {
-      doc
-        .font(strong ? "Helvetica-Bold" : "Helvetica")
-        .fontSize(strong ? 9.5 : 8.5)
-        .fillColor(color || (strong ? BRAND : INK));
-      doc.text(k, panelX + 12, ly + 3, { width: 110 });
-      doc.text(v, panelX + 12, ly + 3, { width: panelW - 24, align: "right" });
-      if (strong && k === "Grand Total")
-        doc.moveTo(panelX + 12, ly).lineTo(panelX + panelW - 12, ly).strokeColor("#c9d4ec").stroke();
-      ly += lineH;
-    });
+    const amtRowH = 15;
+    const amtBlockH = amtRows.length * amtRowH + (prevBalance > 0.009 ? amtRowH * 2 + 4 : 0) + 6;
+    const wordsH = Math.max(
+      amtBlockH,
+      doc.heightOfString(`${amountInWords(total)}`, { width: contentW / 2 - 12 }) + 24
+    );
+    doc.rect(left, y, contentW, wordsH).lineWidth(0.8).strokeColor(OUTER).stroke();
+    vline(left + contentW / 2, y, y + wordsH);
 
-    // status word (plain text, no coloured bar)
-    const statusY = py + panelH + 8;
-    doc
-      .font("Helvetica-Bold")
-      .fontSize(9)
-      .fillColor(isPaid ? "#1B9E5A" : inv.payment_status === "partial" ? "#B87300" : "#C0392B");
-    doc.text(
-      isPaid
-        ? "FULLY PAID"
-        : inv.payment_status === "partial"
-        ? `PAID ${INR(paid)}  •  DUE ${INR(balance)}`
-        : `PAYMENT PENDING  •  ${INR(balance)}`,
-      panelX + 12,
-      statusY,
-      { width: panelW - 24, align: "right" }
+    // words (left)
+    doc.font("Helvetica").fontSize(8.5).fillColor(INK).text(
+      amountInWords(total).replace(/^INR\s+/, "").replace(/\s+Only\.$/, " Rupees only"),
+      left + 6,
+      y + 8,
+      { width: contentW / 2 - 12 }
     );
 
-    // amount in words (left column, aligned with the panel top)
-    doc.font("Helvetica-Oblique").fontSize(8.5).fillColor(MUTE);
-    doc.text(`Amount in words: ${amountInWords(total)}`, left, py + 2, {
-      width: contentW - panelW - 20,
-    });
-
-    doc.y = Math.max(statusY + 14, py + panelH) + 22;
-
-    // ============ 6. footer — thanks · notes · terms ============
-    doc.moveTo(left, doc.y).lineTo(right, doc.y).strokeColor(HAIR).stroke();
-    doc.y += 10;
-    doc.font("Helvetica-Bold").fontSize(9).fillColor(INK).text("Thanks for your business.", left, doc.y);
-    doc.y += 16;
-
-    if (inv.notes && String(inv.notes).trim()) {
-      doc.font("Helvetica-Bold").fontSize(8).fillColor(INK).text("Notes / Additional Info", left, doc.y);
+    // amounts (right)
+    const ax = left + contentW / 2;
+    let ay = y + 4;
+    const amtLine = (k: string, v: string, strong: boolean, topBorder = false) => {
+      if (topBorder) doc.moveTo(ax, ay).lineTo(right, ay).lineWidth(0.6).strokeColor(HAIR).stroke();
       doc
-        .font("Helvetica")
-        .fontSize(7.5)
-        .fillColor(MUTE)
-        .text(String(inv.notes).trim(), left, doc.y + 11, { width: contentW });
-      doc.y += 12;
+        .font(strong ? "Helvetica-Bold" : "Helvetica")
+        .fontSize(8.5)
+        .fillColor(INK);
+      doc.text(k, ax + 6, ay + 3.5, { width: 120 });
+      doc.text(v, ax + 6, ay + 3.5, { width: contentW / 2 - 12, align: "right" });
+      ay += amtRowH;
+    };
+    amtRows.forEach(([k, v, s], i) => amtLine(k, v, s, i > 0));
+    if (prevBalance > 0.009) {
+      ay += 4;
+      amtLine("Previous Balance", INR(prevBalance), false, true);
+      amtLine("Current Balance", INR(currentBalance), true, false);
     }
+    y += wordsH;
 
-    doc.font("Helvetica-Bold").fontSize(8).fillColor(INK).text("Terms & Conditions", left, doc.y);
+    // ---- Terms and Conditions band + signatory ----
+    band(y, bandH);
+    doc.font("Helvetica-Bold").fontSize(8.5).fillColor(BAND_TEXT).text("Terms and Conditions", left + 6, y + 4);
+    y += bandH;
+
+    const footH = 70;
+    doc.rect(left, y, contentW, footH).lineWidth(0.8).strokeColor(OUTER).stroke();
+    vline(left + contentW / 2, y, y + footH);
+    doc.font("Helvetica").fontSize(8).fillColor(INK).text(
+      inv.notes && String(inv.notes).trim()
+        ? String(inv.notes).trim()
+        : "Thanks for doing business with us!",
+      left + 6,
+      y + 8,
+      { width: contentW / 2 - 12 }
+    );
+    doc.font("Helvetica").fontSize(8.5).fillColor(INK).text(
+      `For : ${(co.name || "Company").toUpperCase()}`,
+      left + contentW / 2 + 6,
+      y + 8,
+      { width: contentW / 2 - 12, align: "center" }
+    );
+    doc.font("Helvetica-Bold").fontSize(8.5).fillColor(INK).text(
+      "Authorized Signatory",
+      left + contentW / 2 + 6,
+      y + footH - 16,
+      { width: contentW / 2 - 12, align: "center" }
+    );
+    y += footH;
+
+    // ---- full outer page border ----
     doc
-      .font("Helvetica")
-      .fontSize(7.5)
-      .fillColor(MUTE)
-      .text(
-        "Full payment is due upon receipt of this invoice. Late payments may incur additional charges or interest as per applicable laws.",
-        left,
-        doc.y + 11,
-        { width: contentW }
-      );
+      .rect(left - 4, left - 4, contentW + 8, y - (left - 4) + 6)
+      .lineWidth(1)
+      .strokeColor(OUTER)
+      .stroke();
 
     doc.end();
   });

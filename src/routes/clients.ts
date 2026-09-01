@@ -52,6 +52,75 @@ router.get("/:id", async (req, res, next) => {
   }
 });
 
+// Full activity view for one client: KPIs, every invoice, products bought.
+router.get("/:id/summary", async (req, res, next) => {
+  try {
+    const cid = req.params.id;
+    const base = await query<any>(
+      "SELECT id, name, address, phone, email, gstin FROM clients WHERE id = ?",
+      [cid]
+    );
+    if (!base[0]) {
+      res.status(404).json({ error: "Client not found" });
+      return;
+    }
+
+    const invoices = await query<any>(
+      `SELECT i.id, i.number, i.invoice_date, i.due_date, i.total, i.amount_paid,
+              (i.total - i.amount_paid) AS balance, i.payment_status,
+              co.name AS company_name
+         FROM invoices i
+         LEFT JOIN companies co ON co.id = i.company_id
+        WHERE i.client_id = ?
+        ORDER BY i.invoice_date DESC, i.id DESC`,
+      [cid]
+    );
+
+    const [agg] = await query<any>(
+      `SELECT COUNT(*) AS invoice_count,
+              COALESCE(SUM(total), 0) AS total_invoiced,
+              COALESCE(SUM(amount_paid), 0) AS total_paid,
+              COALESCE(SUM(total - amount_paid), 0) AS outstanding,
+              COALESCE(SUM(CASE WHEN (total - amount_paid) > 0.009 THEN 1 ELSE 0 END), 0) AS unpaid_count,
+              MIN(invoice_date) AS first_invoice,
+              MAX(invoice_date) AS last_invoice
+         FROM invoices WHERE client_id = ?`,
+      [cid]
+    );
+
+    const products = await query<any>(
+      `SELECT ii.description,
+              SUM(ii.qty) AS qty,
+              SUM(ii.amount) AS value,
+              COUNT(DISTINCT ii.invoice_id) AS invoice_count,
+              MAX(i.invoice_date) AS last_bought
+         FROM invoice_items ii
+         JOIN invoices i ON i.id = ii.invoice_id
+        WHERE i.client_id = ?
+        GROUP BY ii.description
+        ORDER BY value DESC`,
+      [cid]
+    );
+
+    res.json({
+      client: base[0],
+      kpis: {
+        invoice_count: Number(agg?.invoice_count || 0),
+        total_invoiced: Number(agg?.total_invoiced || 0),
+        total_paid: Number(agg?.total_paid || 0),
+        outstanding: Number(agg?.outstanding || 0),
+        unpaid_count: Number(agg?.unpaid_count || 0),
+        first_invoice: agg?.first_invoice ?? null,
+        last_invoice: agg?.last_invoice ?? null,
+      },
+      invoices,
+      products,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post("/", requireAdmin, async (req, res, next) => {
   try {
     const name = (req.body.name || "").trim();
