@@ -403,6 +403,19 @@ export async function initDb(): Promise<void> {
     ) ENGINE=InnoDB
   `);
 
+  // Bank accounts — one belongs to exactly one company (firm).
+  // Created before purchase_payments / invoice_payments because they FK to it.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bank_accounts (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      company_id INT NOT NULL,
+      name VARCHAR(255) NOT NULL,
+      last4 VARCHAR(4),
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT fk_ba_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB
+  `);
+
   // Payments YOU made against a supplier bill.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS purchase_payments (
@@ -421,18 +434,6 @@ export async function initDb(): Promise<void> {
   await pool
     .query(`CREATE INDEX idx_pp_bill ON purchase_payments (purchase_invoice_id)`)
     .catch(() => {});
-
-  // Bank accounts — one belongs to exactly one company (firm).
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS bank_accounts (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      company_id INT NOT NULL,
-      name VARCHAR(255) NOT NULL,
-      last4 VARCHAR(4),
-      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      CONSTRAINT fk_ba_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
-    ) ENGINE=InnoDB
-  `);
 
   // Itemised invoice payments. invoices.amount_paid / payment_status are kept in
   // sync from these rows (recomputeInvoicePayment). note: invoices that had a
