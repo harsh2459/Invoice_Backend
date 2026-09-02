@@ -208,6 +208,7 @@ export async function initDb(): Promise<void> {
   await ensureColumn("products", "stock_qty", "DECIMAL(12,3) NOT NULL DEFAULT 0");
   await ensureColumn("products", "reorder_level", "DECIMAL(12,3) NOT NULL DEFAULT 0");
   await ensureColumn("products", "opening_stock", "DECIMAL(12,3) NOT NULL DEFAULT 0");
+  await ensureColumn("products", "cost_price", "DECIMAL(12,2) NOT NULL DEFAULT 0");
 
   // Immutable stock ledger. products.stock_qty is the denormalised running total.
   await pool.query(`
@@ -231,6 +232,14 @@ export async function initDb(): Promise<void> {
     .catch(() => {});
   await pool
     .query(`CREATE INDEX idx_sm_ref ON stock_movements (ref_type, ref_id)`)
+    .catch(() => {});
+  // widen enums for returns (no-op if already wide)
+  await pool
+    .query(
+      `ALTER TABLE stock_movements
+         MODIFY reason ENUM('purchase','sale','adjustment','opening','sales_return','purchase_return') NOT NULL,
+         MODIFY ref_type ENUM('purchase_invoice','invoice','manual','sales_return','purchase_return') NOT NULL DEFAULT 'manual'`
+    )
     .catch(() => {});
 
   // Per-company low-stock WhatsApp alert config (one row per company).
@@ -452,6 +461,109 @@ export async function initDb(): Promise<void> {
       CONSTRAINT fk_ip_created_by FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
     ) ENGINE=InnoDB
   `);
+  // Link an invoice_payments row back to the on-account receipt it came from
+  // (NULL = a payment recorded directly against one invoice).
+  await ensureColumn("invoice_payments", "receipt_id", "INT");
+  await ensureColumn(
+    "invoice_payments",
+    "mode",
+    "ENUM('cash','upi','bank','cheque','card','other') NOT NULL DEFAULT 'cash'"
+  );
+  await ensureColumn("invoice_payments", "reference", "VARCHAR(120)");
+
+  // Single append-only ledger. Every money-moving event (invoice, receipt,
+  // return, ...) writes ONE row here. A party's balance is always
+  //   SUM(debit) - SUM(credit)   for client  → positive = they owe us
+  //                              for supplier → positive = we owe them
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ledger_entries (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      party_type ENUM('client','supplier') NOT NULL,
+      party_id INT NOT NULL,
+      company_id INT,
+      entry_date DATE NOT NULL,
+      source_type ENUM('invoice','receipt','sales_return','purchase','payment','purchase_return','opening','adjustment') NOT NULL,
+      source_id INT,
+      particulars VARCHAR(255) NOT NULL,
+      ref VARCHAR(64),
+      debit DECIMAL(14,2) NOT NULL DEFAULT 0,
+      credit DECIMAL(14,2) NOT NULL DEFAULT 0,
+      created_by INT,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_le_party (party_type, party_id, entry_date, id),
+      INDEX idx_le_source (source_type, source_id)
+    ) ENGINE=InnoDB
+  `);
+
+  // On-account payments from a client, not tied to one bill at entry time. Each
+  // receipt is FIFO-applied to the client's oldest unpaid invoices; whatever is
+  // left sits in `unapplied` as an advance/credit.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS client_receipts (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      client_id INT NOT NULL,
+      company_id INT,
+      number VARCHAR(64),
+      receipt_date DATE NOT NULL,
+      amount DECIMAL(12,2) NOT NULL,
+      unapplied DECIMAL(12,2) NOT NULL DEFAULT 0,
+      bank_account_id INT,
+      notes TEXT,
+      created_by INT,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT fk_cr_client FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE,
+      CONSTRAINT fk_cr_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE SET NULL,
+      CONSTRAINT fk_cr_bank FOREIGN KEY (bank_account_id) REFERENCES bank_accounts(id) ON DELETE SET NULL,
+      CONSTRAINT fk_cr_created_by FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB
+  `);
+  await ensureColumn(
+    "client_receipts",
+    "mode",
+    "ENUM('cash','upi','bank','cheque','card','other') NOT NULL DEFAULT 'cash'"
+  );
+  await ensureColumn("client_receipts", "reference", "VARCHAR(120)");
+
+  // Goods a customer sent back. Reduces their ledger balance (credit note);
+  // restocks inventory unless the goods were damaged.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sales_returns (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      client_id INT NOT NULL,
+      company_id INT,
+      invoice_id INT,
+      number VARCHAR(64),
+      return_date DATE NOT NULL,
+      reason ENUM('damaged','wrong_item','excess','not_needed','other') NOT NULL DEFAULT 'other',
+      restock TINYINT(1) NOT NULL DEFAULT 1,
+      subtotal DECIMAL(12,2) NOT NULL DEFAULT 0,
+      tax_total DECIMAL(12,2) NOT NULL DEFAULT 0,
+      total DECIMAL(12,2) NOT NULL DEFAULT 0,
+      notes TEXT,
+      created_by INT,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT fk_sret_client FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE,
+      CONSTRAINT fk_sret_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE SET NULL,
+      CONSTRAINT fk_sret_invoice FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE SET NULL,
+      CONSTRAINT fk_sret_created_by FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sales_return_items (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      sales_return_id INT NOT NULL,
+      product_id INT,
+      description VARCHAR(255) NOT NULL,
+      hsn VARCHAR(16),
+      qty DECIMAL(12,2) NOT NULL DEFAULT 1,
+      rate DECIMAL(12,2) NOT NULL DEFAULT 0,
+      amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+      gst_rate DECIMAL(5,2) NOT NULL DEFAULT 0,
+      tax_amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+      CONSTRAINT fk_sreti_ret FOREIGN KEY (sales_return_id) REFERENCES sales_returns(id) ON DELETE CASCADE,
+      CONSTRAINT fk_sreti_product FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB
+  `);
 
   // ---- WhatsApp integration ----
 
@@ -566,6 +678,42 @@ export async function initDb(): Promise<void> {
 
   // ---- Collator module (marketplace ingestion + ledger) ----
   await initCollatorSchema(pool);
+
+  // ---- one-time backfill of ledger_entries from existing docs ----
+  const [le] = await query<{ n: number }>("SELECT COUNT(*) AS n FROM ledger_entries");
+  const [invN] = await query<{ n: number }>("SELECT COUNT(*) AS n FROM invoices");
+  if ((le?.n ?? 0) === 0 && (invN?.n ?? 0) > 0) {
+    // sales invoices → debit
+    await exec(`
+      INSERT INTO ledger_entries
+        (party_type, party_id, company_id, entry_date, source_type, source_id, particulars, ref, debit, credit, created_by)
+      SELECT 'client', i.client_id, i.company_id, i.invoice_date, 'invoice', i.id,
+             CONCAT('Sales Invoice', IFNULL(CONCAT(' — ', co.name), '')),
+             i.number, i.total, 0, i.created_by
+        FROM invoices i LEFT JOIN companies co ON co.id = i.company_id
+       WHERE i.client_id IS NOT NULL
+    `);
+    // on-account receipts → credit
+    await exec(`
+      INSERT INTO ledger_entries
+        (party_type, party_id, company_id, entry_date, source_type, source_id, particulars, ref, debit, credit, created_by)
+      SELECT 'client', r.client_id, r.company_id, r.receipt_date, 'receipt', r.id,
+             CONCAT('Payment Received', IFNULL(CONCAT(' — ', r.notes), '')),
+             r.number, 0, r.amount, r.created_by
+        FROM client_receipts r
+    `);
+    // direct "paid now" on an invoice (not linked to a receipt) → credit
+    await exec(`
+      INSERT INTO ledger_entries
+        (party_type, party_id, company_id, entry_date, source_type, source_id, particulars, ref, debit, credit, created_by)
+      SELECT 'client', i.client_id, i.company_id, ip.paid_on, 'payment', ip.id,
+             CONCAT('Payment against ', IFNULL(i.number, CONCAT('#', i.id))),
+             i.number, 0, ip.amount, ip.created_by
+        FROM invoice_payments ip JOIN invoices i ON i.id = ip.invoice_id
+       WHERE ip.receipt_id IS NULL AND i.client_id IS NOT NULL
+    `);
+    console.log("Backfilled ledger_entries from existing invoices / receipts / payments");
+  }
 
   const rows = await query<{ count: number }>(
     "SELECT COUNT(*) AS count FROM users WHERE role = 'admin'"

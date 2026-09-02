@@ -14,8 +14,8 @@ interface Tx {
   exec: (sql: string, params?: any[]) => Promise<{ affectedRows: number; insertId?: number }>;
 }
 
-export type RefType = "purchase_invoice" | "invoice";
-export type Reason = "purchase" | "sale" | "adjustment" | "opening";
+export type RefType = "purchase_invoice" | "invoice" | "sales_return" | "purchase_return";
+export type Reason = "purchase" | "sale" | "adjustment" | "opening" | "sales_return" | "purchase_return";
 
 const round3 = (n: number) => Math.round((n + Number.EPSILON) * 1000) / 1000;
 
@@ -49,7 +49,14 @@ export async function applyStockForDocument(
   }
   if (byProduct.size === 0) return;
 
-  const reason: Reason = opts.direction === 1 ? "purchase" : "sale";
+  const reason: Reason =
+    opts.refType === "sales_return"
+      ? "sales_return"
+      : opts.refType === "purchase_return"
+      ? "purchase_return"
+      : opts.direction === 1
+      ? "purchase"
+      : "sale";
 
   for (const [productId, qty] of byProduct) {
     if (!(qty > 0)) continue;

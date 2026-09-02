@@ -21,6 +21,9 @@ import bankAccountsRoutes from "./routes/bankAccounts";
 import whatsappRoutes from "./routes/whatsapp";
 import collatorRoutes from "./routes/collator";
 import publicInvoiceRoutes from "./routes/publicInvoice";
+import returnsRoutes from "./routes/returns";
+import documentsRoutes from "./routes/documents";
+import pnlInvoicingRoutes from "./routes/pnlInvoicing";
 import { initDb } from "./db";
 import { config } from "./config";
 import { initAll as initWhatsAppAll } from "./whatsapp";
@@ -58,6 +61,9 @@ app.use("/api/purchases", purchasesRoutes);
 app.use("/api/bank-accounts", bankAccountsRoutes);
 app.use("/api/whatsapp", whatsappRoutes);
 app.use("/api/collator", collatorRoutes);
+app.use("/api/returns", returnsRoutes);
+app.use("/api/documents", documentsRoutes);
+app.use("/api/pnl", pnlInvoicingRoutes);
 app.use("/api/public", publicInvoiceRoutes);
 
 // Serve the built frontend unless explicitly disabled. The API is mounted above,

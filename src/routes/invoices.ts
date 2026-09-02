@@ -12,6 +12,7 @@ import {
 } from "../invoiceMath";
 import { renderInvoicePdf } from "../invoicePdf";
 import { applyStockForDocument, reverseStockForDocument } from "../stock";
+import { postEntry, voidEntriesFor, partyBalance } from "../ledger";
 
 const router = Router();
 router.use(authenticate);
@@ -107,7 +108,7 @@ router.get("/next-number/:companyId", async (req, res, next) => {
 });
 
 // ---- client's outstanding balance (form helper) ----
-// Sum of (total - amount_paid) across all of a client's invoices, all companies.
+// True ledger balance across all companies.
 
 router.get("/client-balance", async (req, res, next) => {
   try {
@@ -116,12 +117,7 @@ router.get("/client-balance", async (req, res, next) => {
       res.json({ prior_due: 0 });
       return;
     }
-    const [row] = await query<{ bal: string | number }>(
-      `SELECT COALESCE(SUM(total - amount_paid), 0) AS bal
-         FROM invoices WHERE client_id = ?`,
-      [clientId]
-    );
-    res.json({ prior_due: round2(Number(row?.bal ?? 0)) });
+    res.json({ prior_due: await partyBalance("client", clientId) });
   } catch (err) {
     next(err);
   }
@@ -152,7 +148,7 @@ router.get("/:id", async (req, res, next) => {
       [req.params.id]
     );
     const payments = await query(
-      `SELECT ip.id, ip.paid_on, ip.amount, ip.bank_account_id,
+      `SELECT ip.id, ip.paid_on, ip.amount, ip.mode, ip.reference, ip.bank_account_id,
               ba.name AS bank_name, ba.last4 AS bank_last4
        FROM invoice_payments ip
        LEFT JOIN bank_accounts ba ON ba.id = ip.bank_account_id
@@ -160,6 +156,20 @@ router.get("/:id", async (req, res, next) => {
        ORDER BY ip.paid_on, ip.id`,
       [req.params.id]
     );
+
+    // return created on the same document (POST /invoices with return_items)
+    const [linkedReturn] = await query<any>(
+      `SELECT id, number, return_date, reason, restock, subtotal, tax_total, total, notes
+         FROM sales_returns WHERE invoice_id = ? ORDER BY id LIMIT 1`,
+      [req.params.id]
+    );
+    let returnItems: any[] = [];
+    if (linkedReturn) {
+      returnItems = await query(
+        "SELECT id, product_id, description, hsn, qty, rate, amount, gst_rate, tax_amount FROM sales_return_items WHERE sales_return_id = ? ORDER BY id",
+        [linkedReturn.id]
+      );
+    }
 
     const inv = rows[0];
     const previous_balance = await previousClientBalance(
@@ -172,7 +182,14 @@ router.get("/:id", async (req, res, next) => {
     );
     const current_balance = round2(previous_balance + Number(inv.balance || 0));
 
-    res.json({ ...inv, items, payments, previous_balance, current_balance });
+    res.json({
+      ...inv,
+      items,
+      payments,
+      previous_balance,
+      current_balance,
+      linked_return: linkedReturn ? { ...linkedReturn, items: returnItems } : null,
+    });
   } catch (err) {
     next(err);
   }
@@ -288,6 +305,21 @@ router.post("/", requireAdmin, async (req: AuthRequest, res, next) => {
         note: `Invoice ${finalNumber}`,
       });
 
+      // LEDGER: the sale — customer owes us `total`
+      const coRow = await tx.query<any>("SELECT name FROM companies WHERE id = ?", [company_id]);
+      await postEntry(tx, {
+        partyType: "client",
+        partyId: Number(client_id),
+        companyId: Number(company_id),
+        date: invoice_date,
+        sourceType: "invoice",
+        sourceId: header.insertId,
+        particulars: `Sales Invoice${coRow[0]?.name ? ` — ${coRow[0].name}` : ""}`,
+        ref: finalNumber,
+        debit: t.total,
+        userId: req.user!.id,
+      });
+
       // optional "payment received now" recorded with the invoice.
       // If it exceeds this invoice's total, the surplus is applied to the
       // client's oldest unpaid invoices (FIFO) — settling old dues.
@@ -296,9 +328,18 @@ router.post("/", requireAdmin, async (req: AuthRequest, res, next) => {
       if (payAmount > 0) {
         const paidOn =
           (req.body.payment?.paid_on as string) || invoice_date || new Date().toISOString().slice(0, 10);
-        let bankId = req.body.payment?.bank_account_id
-          ? Number(req.body.payment.bank_account_id)
-          : null;
+        const mode = ["cash", "upi", "bank", "cheque", "card", "other"].includes(
+          req.body.payment?.mode
+        )
+          ? req.body.payment.mode
+          : "cash";
+        const reference = (req.body.payment?.reference || "").trim().slice(0, 120) || null;
+        let bankId =
+          mode === "cash"
+            ? null
+            : req.body.payment?.bank_account_id
+            ? Number(req.body.payment.bank_account_id)
+            : null;
         if (bankId) {
           const ba = await tx.query<any>(
             "SELECT company_id FROM bank_accounts WHERE id = ?",
@@ -310,8 +351,8 @@ router.post("/", requireAdmin, async (req: AuthRequest, res, next) => {
         // 1. this invoice first
         const onThis = round2(Math.min(payAmount, t.total));
         await tx.exec(
-          "INSERT INTO invoice_payments (invoice_id, bank_account_id, paid_on, amount, created_by) VALUES (?, ?, ?, ?, ?)",
-          [header.insertId, bankId, paidOn, onThis, req.user!.id]
+          "INSERT INTO invoice_payments (invoice_id, bank_account_id, paid_on, amount, mode, reference, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          [header.insertId, bankId, paidOn, onThis, mode, reference, req.user!.id]
         );
         payInfo = await recomputeInvoicePayment(tx, header.insertId);
 
@@ -329,20 +370,127 @@ router.post("/", requireAdmin, async (req: AuthRequest, res, next) => {
             if (surplus <= 0.009) break;
             const apply = round2(Math.min(surplus, Number(d.due)));
             await tx.exec(
-              "INSERT INTO invoice_payments (invoice_id, bank_account_id, paid_on, amount, created_by) VALUES (?, ?, ?, ?, ?)",
-              [d.id, bankId, paidOn, apply, req.user!.id]
+              "INSERT INTO invoice_payments (invoice_id, bank_account_id, paid_on, amount, mode, reference, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+              [d.id, bankId, paidOn, apply, mode, reference, req.user!.id]
             );
             await recomputeInvoicePayment(tx, d.id);
             surplus = round2(surplus - apply);
           }
         }
+
+        // LEDGER: whole payment recorded at once — customer owes us less
+        const applied = round2(payAmount - surplus);
+        if (applied > 0.009) {
+          const ML: Record<string, string> = {
+            cash: "Cash",
+            upi: "UPI",
+            bank: "Bank Transfer",
+            cheque: "Cheque",
+            card: "Card",
+            other: "Other",
+          };
+          const sfx = [ML[mode], reference].filter(Boolean).join(" · ");
+          await postEntry(tx, {
+            partyType: "client",
+            partyId: Number(client_id),
+            companyId: Number(company_id),
+            date: paidOn,
+            sourceType: "payment",
+            sourceId: header.insertId,
+            particulars: `Payment with ${finalNumber}${sfx ? ` — ${sfx}` : ""}`,
+            ref: finalNumber,
+            credit: applied,
+            userId: req.user!.id,
+          });
+        }
       }
 
-      // client's total outstanding after everything above
-      const [cb] = await tx.query<any>(
-        `SELECT COALESCE(SUM(total - amount_paid), 0) AS bal FROM invoices WHERE client_id = ?`,
-        [client_id]
-      );
+      // ---- optional linked SALES RETURN on the same document ----
+      const rawReturn = Array.isArray(req.body.return_items) ? req.body.return_items : [];
+      const retItems = rawReturn
+        .map((it: any) => ({
+          product_id: it.product_id ? Number(it.product_id) : null,
+          description: (it.description || "").trim(),
+          hsn: (it.hsn || "").trim() || null,
+          qty: Number(it.qty ?? 0),
+          rate: Number(it.rate ?? 0),
+          gst_rate: Number(it.gst_rate ?? 0),
+        }))
+        .filter((it: any) => it.description && it.qty > 0);
+      let returnInfo: { id: number; number: string; total: number } | null = null;
+      if (retItems.length > 0) {
+        const reason = ["damaged", "wrong_item", "excess", "not_needed", "other"].includes(
+          req.body.return_reason
+        )
+          ? req.body.return_reason
+          : "other";
+        const restock = reason === "damaged" ? 0 : 1;
+        const rt = computeTotals(retItems, 0, true);
+        await tx.exec(
+          `INSERT INTO invoice_counters (company_id, year, seq) VALUES (?, ?, 1)
+           ON DUPLICATE KEY UPDATE seq = seq + 1`,
+          [company_id, year]
+        );
+        const [rctr] = await tx.query<any>(
+          "SELECT seq FROM invoice_counters WHERE company_id = ? AND year = ?",
+          [company_id, year]
+        );
+        const rNumber = formatInvoiceNumber("SRET", "SRET", year, rctr.seq);
+        const rHead = await tx.exec(
+          `INSERT INTO sales_returns
+             (client_id, company_id, invoice_id, number, return_date, reason, restock,
+              subtotal, tax_total, total, notes, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            client_id,
+            company_id,
+            header.insertId,
+            rNumber,
+            invoice_date,
+            reason,
+            restock,
+            rt.subtotal,
+            rt.tax_total,
+            rt.total,
+            (req.body.return_notes || "").trim() || null,
+            req.user!.id,
+          ]
+        );
+        const rid = rHead.insertId!;
+        for (const it of rt.items) {
+          await tx.exec(
+            `INSERT INTO sales_return_items
+               (sales_return_id, product_id, description, hsn, qty, rate, amount, gst_rate, tax_amount)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [rid, it.product_id, it.description, it.hsn, it.qty, it.rate, it.amount, it.gst_rate, it.tax_amount]
+          );
+        }
+        if (restock) {
+          await applyStockForDocument(tx, {
+            lines: rt.items.map((it) => ({ product_id: it.product_id, qty: it.qty })),
+            direction: +1,
+            refType: "sales_return",
+            refId: rid,
+            userId: req.user!.id,
+            note: `Return with ${finalNumber}`,
+          });
+        }
+        await postEntry(tx, {
+          partyType: "client",
+          partyId: Number(client_id),
+          companyId: Number(company_id),
+          date: invoice_date,
+          sourceType: "sales_return",
+          sourceId: rid,
+          particulars: `Sales Return with ${finalNumber} (${reason.replace("_", " ")})`,
+          ref: rNumber,
+          credit: rt.total,
+          userId: req.user!.id,
+        });
+        returnInfo = { id: rid, number: rNumber, total: rt.total };
+      }
+
+      const client_balance = await partyBalance("client", Number(client_id), { runner: tx });
 
       return {
         id: header.insertId,
@@ -351,7 +499,8 @@ router.post("/", requireAdmin, async (req: AuthRequest, res, next) => {
         amount_paid: payInfo?.amount_paid ?? 0,
         payment_status: payInfo?.payment_status ?? "unpaid",
         balance: payInfo?.balance ?? t.total,
-        client_balance: round2(Number(cb?.bal ?? 0)),
+        client_balance,
+        linked_return: returnInfo,
       };
     });
 
@@ -445,6 +594,22 @@ router.put("/:id", requireAdmin, async (req: AuthRequest, res, next) => {
         userId: req.user!.id,
         note: `Invoice ${(number || "").trim() || existing[0].number}`,
       });
+
+      // LEDGER: keep the sale entry in sync with the (possibly new) total
+      await voidEntriesFor(tx, "invoice", Number(req.params.id));
+      const coRow = await tx.query<any>("SELECT name FROM companies WHERE id = ?", [company_id]);
+      await postEntry(tx, {
+        partyType: "client",
+        partyId: Number(client_id),
+        companyId: Number(company_id),
+        date: String(existing[0].invoice_date).slice(0, 10),
+        sourceType: "invoice",
+        sourceId: Number(req.params.id),
+        particulars: `Sales Invoice${coRow[0]?.name ? ` — ${coRow[0].name}` : ""}`,
+        ref: (number || "").trim() || existing[0].number,
+        debit: t.total,
+        userId: req.user!.id,
+      });
     });
 
     res.json({ id: Number(req.params.id), total: t.total, payment_status: status });
@@ -502,7 +667,16 @@ router.post("/:id/payment", requireAdmin, async (req: AuthRequest, res, next) =>
     amount = Math.round((amount + Number.EPSILON) * 100) / 100;
 
     const paidOn = (req.body.paid_on as string) || new Date().toISOString().slice(0, 10);
-    const bankAccountId = req.body.bank_account_id ? Number(req.body.bank_account_id) : null;
+    const payMode = ["cash", "upi", "bank", "cheque", "card", "other"].includes(req.body.mode)
+      ? req.body.mode
+      : "cash";
+    const payRef = (req.body.reference || "").trim().slice(0, 120) || null;
+    const bankAccountId =
+      payMode === "cash"
+        ? null
+        : req.body.bank_account_id
+        ? Number(req.body.bank_account_id)
+        : null;
 
     if (bankAccountId) {
       const ba = await query<any>(
@@ -520,10 +694,32 @@ router.post("/:id/payment", requireAdmin, async (req: AuthRequest, res, next) =>
     }
 
     const result = await withTransaction(async (tx) => {
-      await tx.exec(
-        "INSERT INTO invoice_payments (invoice_id, bank_account_id, paid_on, amount, created_by) VALUES (?, ?, ?, ?, ?)",
-        [req.params.id, bankAccountId, paidOn, amount, req.user!.id]
+      const ins = await tx.exec(
+        "INSERT INTO invoice_payments (invoice_id, bank_account_id, paid_on, amount, mode, reference, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [req.params.id, bankAccountId, paidOn, amount, payMode, payRef, req.user!.id]
       );
+      const [clRow] = await tx.query<any>(
+        "SELECT client_id, company_id, number FROM invoices WHERE id = ?",
+        [req.params.id]
+      );
+      if (clRow?.client_id) {
+        const ML: Record<string, string> = {
+          cash: "Cash", upi: "UPI", bank: "Bank Transfer", cheque: "Cheque", card: "Card", other: "Other",
+        };
+        const sfx = [ML[payMode], payRef].filter(Boolean).join(" · ");
+        await postEntry(tx, {
+          partyType: "client",
+          partyId: Number(clRow.client_id),
+          companyId: clRow.company_id ? Number(clRow.company_id) : null,
+          date: paidOn,
+          sourceType: "payment",
+          sourceId: ins.insertId!, // = invoice_payments.id
+          particulars: `Payment against ${clRow.number || `#${req.params.id}`}${sfx ? ` — ${sfx}` : ""}`,
+          ref: clRow.number || null,
+          credit: amount,
+          userId: req.user!.id,
+        });
+      }
       return recomputeInvoicePayment(tx, Number(req.params.id));
     });
 
@@ -541,6 +737,11 @@ router.delete("/:id/payments/:paymentId", requireAdmin, async (req, res, next) =
         [req.params.paymentId, req.params.id]
       );
       if (del.affectedRows === 0) return null;
+      // remove the matching ledger credit (posted with source_id = invoice_payments.id)
+      await tx.exec(
+        "DELETE FROM ledger_entries WHERE source_type = 'payment' AND source_id = ?",
+        [req.params.paymentId]
+      );
       return recomputeInvoicePayment(tx, Number(req.params.id));
     });
     if (!result) {
@@ -555,9 +756,12 @@ router.delete("/:id/payments/:paymentId", requireAdmin, async (req, res, next) =
 
 router.delete("/:id", requireAdmin, async (req, res, next) => {
   try {
+    const id = Number(req.params.id);
     await withTransaction(async (tx) => {
-      await reverseStockForDocument(tx, "invoice", Number(req.params.id)); // add stock back
-      await tx.exec("DELETE FROM invoices WHERE id = ?", [req.params.id]); // items cascade
+      await reverseStockForDocument(tx, "invoice", id); // add stock back
+      await voidEntriesFor(tx, "invoice", id);
+      await voidEntriesFor(tx, "payment", id); // "paid now" credit
+      await tx.exec("DELETE FROM invoices WHERE id = ?", [id]); // items + payments cascade
     });
     res.json({ ok: true });
   } catch (err) {

@@ -93,13 +93,13 @@ export async function previousClientBalance(
   opts: { clientId: number | null; invoiceDate: string; invoiceId: number }
 ): Promise<number> {
   if (!opts.clientId) return 0;
+  // Ledger balance from every entry EXCEPT this invoice's own debit row.
   const rows = await runner.query<{ bal: string | number }>(
-    `SELECT COALESCE(SUM(total - amount_paid), 0) AS bal
-       FROM invoices
-      WHERE client_id = ?
-        AND id <> ?
-        AND (invoice_date < ? OR (invoice_date = ? AND id < ?))`,
-    [opts.clientId, opts.invoiceId, opts.invoiceDate, opts.invoiceDate, opts.invoiceId]
+    `SELECT COALESCE(SUM(debit) - SUM(credit), 0) AS bal
+       FROM ledger_entries
+      WHERE party_type = 'client' AND party_id = ?
+        AND NOT (source_type = 'invoice' AND source_id = ?)`,
+    [opts.clientId, opts.invoiceId]
   );
   return round2(Number(rows[0]?.bal ?? 0));
 }

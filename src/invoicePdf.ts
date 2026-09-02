@@ -56,17 +56,127 @@ export async function renderInvoicePdf(invoiceId: number | string | string[]): P
     [String(invoiceId)]
   );
 
+  // return + payment made on the same document
+  const [linkedReturn] = await query<any>(
+    "SELECT id, number, reason, restock, total FROM sales_returns WHERE invoice_id = ? ORDER BY id LIMIT 1",
+    [String(invoiceId)]
+  );
+  const returnItems = linkedReturn
+    ? await query<any>(
+        "SELECT description, qty, rate, amount FROM sales_return_items WHERE sales_return_id = ? ORDER BY id",
+        [linkedReturn.id]
+      )
+    : [];
+
   const prevBalance = await previousClientBalance(
     { query },
     { clientId: inv.client_id, invoiceDate: String(inv.invoice_date).slice(0, 10), invoiceId: inv.id }
   );
 
-  const buffer = await drawInvoice(inv, co, items, prevBalance);
+  const buffer = await drawInvoice(inv, co, items, prevBalance, {
+    return: linkedReturn ? { ...linkedReturn, items: returnItems } : null,
+  });
   return { buffer, filename: invoicePdfFilename(inv), invoice: inv };
 }
 
-function drawInvoice(inv: any, co: any, items: any[], prevBalance = 0): Promise<Buffer> {
+/**
+ * Load an invoice's data (invoice + company + items + linked return + prev
+ * balance) without drawing anything. Used by the client statement PDF, which
+ * appends every invoice as its own page via {@link drawInvoicePage}.
+ */
+export async function loadInvoiceForPdf(invoiceId: number | string): Promise<{
+  inv: any;
+  co: any;
+  items: any[];
+  prevBalance: number;
+  extra: { return: any | null };
+} | null> {
+  const invRows = await query<any>(
+    `SELECT i.*, cl.name AS client_name, cl.address AS client_address, cl.gstin AS client_gstin,
+            cl.phone AS client_phone, cl.email AS client_email
+     FROM invoices i
+     LEFT JOIN clients cl ON cl.id = i.client_id
+     WHERE i.id = ?`,
+    [String(invoiceId)]
+  );
+  const inv = invRows[0];
+  if (!inv) return null;
+  const coRows = await query<any>(
+    "SELECT name, address, phone, email, gstin, logo FROM companies WHERE id = ?",
+    [inv.company_id]
+  );
+  const co = coRows[0] || {};
+  const items = await query<any>(
+    "SELECT description, hsn, qty, rate, amount, gst_rate, tax_amount FROM invoice_items WHERE invoice_id = ? ORDER BY id",
+    [String(invoiceId)]
+  );
+  const [linkedReturn] = await query<any>(
+    "SELECT id, number, reason, restock, total FROM sales_returns WHERE invoice_id = ? ORDER BY id LIMIT 1",
+    [String(invoiceId)]
+  );
+  const returnItems = linkedReturn
+    ? await query<any>(
+        "SELECT description, qty, rate, amount FROM sales_return_items WHERE sales_return_id = ? ORDER BY id",
+        [linkedReturn.id]
+      )
+    : [];
+  const prevBalance = await previousClientBalance(
+    { query },
+    { clientId: inv.client_id, invoiceDate: String(inv.invoice_date).slice(0, 10), invoiceId: inv.id }
+  );
+  return {
+    inv,
+    co,
+    items,
+    prevBalance,
+    extra: { return: linkedReturn ? { ...linkedReturn, items: returnItems } : null },
+  };
+}
+
+/**
+ * Draw one invoice onto an already-open PDFDocument (adds a fresh page first).
+ * Does not call doc.end(). Mirrors {@link drawInvoice} but skips document
+ * lifecycle so a statement PDF can carry the statement + every invoice.
+ */
+export function drawInvoicePage(
+  doc: InstanceType<typeof PDFDocument>,
+  inv: any,
+  co: any,
+  items: any[],
+  prevBalance = 0,
+  extra: { return: any | null } = { return: null }
+): void {
+  doc.addPage({ margin: 34, size: "A4" });
+  drawInvoiceBody(doc, inv, co, items, prevBalance, extra);
+}
+
+function drawInvoice(
+  inv: any,
+  co: any,
+  items: any[],
+  prevBalance = 0,
+  extra: { return: any | null } = { return: null }
+): Promise<Buffer> {
   return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 34, size: "A4" });
+    const chunks: Buffer[] = [];
+    doc.on("data", (c: Buffer) => chunks.push(c));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+    drawInvoiceBody(doc, inv, co, items, prevBalance, extra);
+    doc.end();
+  });
+}
+
+function drawInvoiceBody(
+  doc: InstanceType<typeof PDFDocument>,
+  inv: any,
+  co: any,
+  items: any[],
+  prevBalance = 0,
+  extra: { return: any | null } = { return: null }
+): void {
+  {
     const total = Number(inv.total || 0);
     const paid = Number(inv.amount_paid || 0);
     const balance = Math.round((total - paid) * 100) / 100;
@@ -74,12 +184,6 @@ function drawInvoice(inv: any, co: any, items: any[], prevBalance = 0): Promise<
     // HSN column only when at least one line actually has an HSN/SAC.
     const hasHsn = items.some((it: any) => it.hsn && String(it.hsn).trim());
     const qtySum = items.reduce((s: number, it: any) => s + Number(it.qty || 0), 0);
-
-    const doc = new PDFDocument({ margin: 34, size: "A4" });
-    const chunks: Buffer[] = [];
-    doc.on("data", (c: Buffer) => chunks.push(c));
-    doc.on("end", () => resolve(Buffer.concat(chunks)));
-    doc.on("error", reject);
 
     const left = doc.page.margins.left;
     const right = doc.page.width - doc.page.margins.right;
@@ -263,6 +367,47 @@ function drawInvoice(inv: any, co: any, items: any[], prevBalance = 0): Promise<
     vline(right, tableLeftEdge - 16, y);
     doc.moveTo(left, y).lineTo(right, y).lineWidth(0.8).strokeColor(OUTER).stroke();
 
+    // ---- Returned items (same document) ----
+    const ret = extra.return;
+    if (ret && ret.items && ret.items.length) {
+      y += 8;
+      doc.font("Helvetica-Bold").fontSize(8).fillColor("#B87300").text(
+        `Less: Returned Items — ${ret.number} (${String(ret.reason).replace("_", " ")}${
+          ret.restock ? "" : ", not restocked"
+        })`,
+        left,
+        y
+      );
+      y += 12;
+      // small 3-col table: item / qty / amount
+      const rc0 = left,
+        rc1 = right - 200,
+        rc2 = right - 100;
+      doc.rect(left, y, contentW, 14).fill("#f2eefb");
+      doc.font("Helvetica-Bold").fontSize(7.5).fillColor("#5b616b");
+      doc.text("Item", rc0 + 5, y + 4);
+      doc.text("Qty", rc1 + 5, y + 4, { width: 90, align: "right" });
+      doc.text("Amount", rc2 + 5, y + 4, { width: 90, align: "right" });
+      y += 14;
+      doc.font("Helvetica").fontSize(8).fillColor(INK);
+      for (const it of ret.items) {
+        doc.text(it.description, rc0 + 5, y + 3, { width: rc1 - rc0 - 10 });
+        doc.text(String(Number(it.qty)), rc1 + 5, y + 3, { width: 90, align: "right" });
+        doc.fillColor("#C0392B").text("- " + INR(Number(it.amount)), rc2 + 5, y + 3, {
+          width: 90,
+          align: "right",
+        });
+        doc.fillColor(INK);
+        y += 14;
+        rule(y);
+      }
+      doc.font("Helvetica-Bold").fontSize(8).fillColor("#C0392B");
+      doc.text("Return Total", rc1 - 60, y + 3, { width: 120, align: "right" });
+      doc.text("- " + INR(Number(ret.total)), rc2 + 5, y + 3, { width: 90, align: "right" });
+      doc.fillColor(INK);
+      y += 16;
+    }
+
     // ---- Invoice Amount In Words | Amounts ----
     band(y, bandH);
     doc.font("Helvetica-Bold").fontSize(8.5).fillColor(BAND_TEXT);
@@ -279,6 +424,8 @@ function drawInvoice(inv: any, co: any, items: any[], prevBalance = 0): Promise<
     }
     if (Number(inv.tax_total) > 0) amtRows.push(["Total GST", INR(Number(inv.tax_total)), false]);
     amtRows.push(["Total", INR(total), true]);
+    if (extra.return && Number(extra.return.total) > 0.009)
+      amtRows.push(["Less: Return", "- " + INR(Number(extra.return.total)), false]);
     amtRows.push(["Received", INR(paid), false]);
     amtRows.push(["Balance", INR(balance), true]);
 
@@ -356,7 +503,5 @@ function drawInvoice(inv: any, co: any, items: any[], prevBalance = 0): Promise<
       .lineWidth(1)
       .strokeColor(OUTER)
       .stroke();
-
-    doc.end();
-  });
+  }
 }

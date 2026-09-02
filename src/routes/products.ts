@@ -54,7 +54,7 @@ router.get("/low-stock", async (_req, res, next) => {
 router.get("/:id", async (req, res, next) => {
   try {
     const rows = await query<any>(
-      `SELECT id, name, unit, default_rate, gst_rate, hsn,
+      `SELECT id, name, unit, default_rate, cost_price, gst_rate, hsn,
               track_stock, stock_qty, reorder_level, opening_stock
        FROM products WHERE id = ?`,
       [req.params.id]
@@ -80,6 +80,7 @@ interface ParsedProduct {
   name: string;
   unit: string | null;
   default_rate: number;
+  cost_price: number;
   gst_rate: number;
   hsn: string | null;
   track_stock: boolean;
@@ -92,6 +93,8 @@ function parseBody(body: any): ParsedProduct | string {
   if (!name) return "Name is required";
   const rate = Number(body.default_rate ?? 0);
   if (!(rate >= 0) || Number.isNaN(rate)) return "Default rate must be zero or more";
+  const cost = Number(body.cost_price ?? 0);
+  if (!(cost >= 0) || Number.isNaN(cost)) return "Cost price must be zero or more";
   const gst = Number(body.gst_rate ?? 0);
   if (!(gst >= 0) || Number.isNaN(gst)) return "GST rate must be zero or more";
   const trackStock = body.track_stock === true || body.track_stock === 1 || body.track_stock === "1";
@@ -103,6 +106,7 @@ function parseBody(body: any): ParsedProduct | string {
     name,
     unit: (body.unit || "").trim() || null,
     default_rate: rate,
+    cost_price: cost,
     gst_rate: gst,
     hsn: (body.hsn || "").trim() || null,
     track_stock: trackStock,
@@ -121,12 +125,13 @@ router.post("/", requireAdmin, async (req: AuthRequest, res, next) => {
     try {
       const id = await withTransaction(async (tx) => {
         const result = await tx.exec(
-          `INSERT INTO products (name, unit, default_rate, gst_rate, hsn, track_stock, reorder_level)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO products (name, unit, default_rate, cost_price, gst_rate, hsn, track_stock, reorder_level)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             parsed.name,
             parsed.unit,
             parsed.default_rate,
+            parsed.cost_price,
             parsed.gst_rate,
             parsed.hsn,
             parsed.track_stock ? 1 : 0,
@@ -166,12 +171,13 @@ router.put("/:id", requireAdmin, async (req: AuthRequest, res, next) => {
     try {
       const affected = await withTransaction(async (tx) => {
         const result = await tx.exec(
-          `UPDATE products SET name = ?, unit = ?, default_rate = ?, gst_rate = ?, hsn = ?,
+          `UPDATE products SET name = ?, unit = ?, default_rate = ?, cost_price = ?, gst_rate = ?, hsn = ?,
              track_stock = ?, reorder_level = ? WHERE id = ?`,
           [
             parsed.name,
             parsed.unit,
             parsed.default_rate,
+            parsed.cost_price,
             parsed.gst_rate,
             parsed.hsn,
             parsed.track_stock ? 1 : 0,
